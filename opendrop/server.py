@@ -611,9 +611,57 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                     out += payload if stored else zlib.decompress(payload)
             return bytes(out)
 
+        class DvzipEnd:
+            """Spot the end of a dvzip upload from its content (local patch).
+
+            iOS 26 sends every chunk and then holds back the closing 0-chunk, waiting for our reply,
+            so the read loop below used to sit out its 30 s stall timeout on every transfer and then
+            "salvage" an upload that was complete all along (measured: 17 whole chunks, 783320 B, no
+            terminator, four runs out of four). The archive itself says when it is done: once the
+            decoded cpio reaches TotalBytes and ends in the TRAILER!!! record, nothing more is coming.
+            Blocks are decoded as they complete, keeping only a counter and a short tail.
+            """
+
+            def __init__(self, total):
+                self.total = total
+                self.pending = bytearray()
+                self.decoded = 0
+                self.tail = b""
+                self.done = False
+
+            def feed(self, data):
+                if self.done:
+                    return
+                self.pending += data
+                while len(self.pending) >= 4:
+                    (raw,) = struct.unpack(">I", self.pending[:4])
+                    length = raw & 0x7FFFFFFF
+                    if length == 0:          # the container's own terminator
+                        self.done = True
+                        return
+                    if len(self.pending) < 4 + length:
+                        break
+                    payload = bytes(self.pending[4:4 + length])
+                    del self.pending[:4 + length]
+                    try:
+                        out = payload if raw >> 31 else zlib.decompress(payload)
+                    except zlib.error:
+                        self.total = None    # not what we think it is: never finish early
+                        return
+                    self.decoded += len(out)
+                    self.tail = (self.tail + out)[-1024:]
+                if self.total is not None and self.decoded >= self.total and b"TRAILER!!!" in self.tail:
+                    self.done = True
+
         logger.info("Receiving file(s) ...")
         start = time.time()
         reader = HTTPChunkedReader(self.rfile)
+        try:
+            dvzip_end = DvzipEnd(int(self.headers.get("TotalBytes", "")))
+        except ValueError:
+            dvzip_end = None
+        if "dvzip" not in self.headers.get("content-type", ""):
+            dvzip_end = None
 
         # Buffer to disk first, then extract. Extracting straight off the socket
         # means a container libarchive cannot parse leaves us with a half-read
@@ -680,6 +728,11 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                     if not buf:
                         break
                     raw.write(buf)
+                    if dvzip_end is not None:
+                        dvzip_end.feed(buf)
+                        if dvzip_end.done:
+                            logger.info(f"archive complete after {reader.total} B - not waiting for the 0-chunk")
+                            break
 
                     now = time.monotonic()
                     gap, last = now - last, now
