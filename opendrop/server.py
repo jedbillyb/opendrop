@@ -38,6 +38,56 @@ from .util import AirDropUtil
 
 logger = logging.getLogger(__name__)
 
+# AirDrop carries a shared link in the /Ask body's "Items" array rather than as
+# a file, so a link arrives with an empty "Files" and never touches /Upload.
+# Everything about links lives in these two helpers.
+URL_SCHEMES = ("http://", "https://")
+
+
+def ask_items(req):
+    """URLs from an /Ask body. Empty for a normal file transfer."""
+    items = req.get("Items") or []
+    out = []
+    for item in items:
+        # iOS sends plain strings; be tolerant of a dict wrapper anyway, since
+        # a shape we do not recognise should degrade to "no links", never to a
+        # crash inside the consent path.
+        if isinstance(item, bytes):
+            item = item.decode("utf-8", "replace")
+        elif isinstance(item, dict):
+            item = item.get("URL") or item.get("url") or ""
+        if isinstance(item, str) and item.lower().startswith(URL_SCHEMES):
+            out.append(item)
+    return out
+
+
+def open_url(url):
+    """
+    Hand a received link to AIRDROP_URL_HOOK, or to xdg-open if unset.
+
+    Detached deliberately: the /Ask response is what tells the phone the share
+    succeeded, and blocking it on a browser start would stall the transfer and
+    time the sender out.
+    """
+    import shutil
+    import subprocess
+
+    hook = os.environ.get("AIRDROP_URL_HOOK") or shutil.which("xdg-open")
+    if not hook:
+        logger.warning("received link %s but no AIRDROP_URL_HOOK and no xdg-open", url)
+        return
+    try:
+        subprocess.Popen(
+            [hook, url],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("opened received link: %s", url)
+    except Exception as e:
+        logger.error("could not open received link %s (%s)", url, e)
+
 
 class AirDropServer:
     """
@@ -365,6 +415,12 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 detail = ", ".join(names[:3])
                 if len(names) > 3:
                     detail += f" (+{len(names) - 3} more)"
+            elif ask_items(req):
+                # A link share carries no Files at all, so without this the
+                # prompt would say "accept 0 files" and the user would have no
+                # idea what they were agreeing to open.
+                urls = ask_items(req)
+                detail = urls[0] if len(urls) == 1 else f"{urls[0]} (+{len(urls) - 1} more)"
         except Exception:
             # A malformed body is exactly when we least want to auto-accept,
             # but it is also not a reason to crash - fall through and ask with
@@ -392,6 +448,17 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", 0)
             self.end_headers()
             return
+
+        # A shared link never reaches /Upload - iOS puts it in the /Ask body's
+        # "Items" and considers the transfer done the moment we answer 200. So
+        # this is the only place a URL can be delivered from, and doing it
+        # after the consent check means a declined share opens nothing.
+        try:
+            urls = ask_items(plistlib.loads(post_data))
+        except Exception:
+            urls = []
+        for url in urls:
+            open_url(url)
 
         ask_response = {
             "ReceiverModelName": self.config.computer_model,
