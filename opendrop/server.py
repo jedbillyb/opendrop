@@ -748,7 +748,14 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 # bytes deleted when not one file had been recovered. That is
                 # the .partial guarantee falling over.
                 regular = (mode & 0o170000) == 0o100000
-                out.append((name, data_off + filesize <= n, regular))
+                # HOW MANY BYTES ACTUALLY ARRIVED, not just whether the member
+                # is whole. libarchive pads a truncated member out to its
+                # declared size, so the file on disk is the right length and
+                # ends in nulls - measured at 71% padding on one 1.78 MB photo.
+                # The archive itself says where the real data stops: everything
+                # from data_off to the end of what was received.
+                arrived = min(filesize, max(0, n - data_off))
+                out.append((name, data_off + filesize <= n, regular, arrived))
                 off = data_off + filesize
             return out
 
@@ -760,7 +767,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             failure.
             """
             good, bad = [], []
-            for name, complete, regular in odc_members(cpio_bytes):
+            for name, complete, regular, arrived in odc_members(cpio_bytes):
                 base = os.path.basename(name)
                 if not base or base == "." or base.startswith("._"):
                     continue
@@ -782,6 +789,25 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                     good.append(base)
                 else:
                     bad.append(base)
+                    # TRIM THE PADDING. Keeping it made the .partial claim
+                    # technically true and practically useless: the reader
+                    # cannot tell 512 KB of photo from 1.2 MB of nulls behind
+                    # it, and every tool that opens the file walks into the
+                    # padding. `arrived` comes from the archive, so this cuts at
+                    # the real end rather than stripping trailing zeros a file
+                    # may legitimately have.
+                    try:
+                        if arrived < os.path.getsize(path):
+                            os.truncate(path, arrived)
+                    except OSError:
+                        pass
+                    # A SEPARATE try, because the rename IS the guarantee. Shared
+                    # with the truncate, a failure there - read-only mount,
+                    # ENOSPC on the metadata update, a file already unlinked -
+                    # skipped the rename and left an incomplete file under its
+                    # real name, looking whole to everything downstream. Worst
+                    # case now is a padded .partial, which is where this started,
+                    # rather than a truncated one nothing marks as short.
                     try:
                         os.replace(path, path + ".partial")
                     except OSError:
