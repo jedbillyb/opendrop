@@ -283,11 +283,24 @@ class AirDropClient:
             ask_body["SenderRecordData"] = self.config.record_data
 
         def file_entries(files):
+            # ONE SNIFF PER FILE. `flp` used to be computed once, from
+            # file_path[0], in the icon block below, and every entry was
+            # announced with that type. With a single file it is always right,
+            # which is why it survived; with several it is right only when they
+            # happen to share a type. A PNG and a PDF in one transfer had the
+            # PDF announced as public.image.
+            #
+            # FileType is what the receiver routes on, so this is not cosmetic:
+            # four files out of five land wrong while the first one looks
+            # perfect, which is the kind of failure that gets reported months
+            # later as AirDrop mangling things.
             for file in files:
+                with open(file, "rb") as handle:
+                    entry_flp = fleep.get(handle.read(128))
                 file_name = os.path.basename(file)
                 file_entry = {
                     "FileName": file_name,
-                    "FileType": AirDropUtil.get_uti_type(flp),
+                    "FileType": AirDropUtil.get_uti_type(entry_flp),
                     "FileBomPath": os.path.join(".", file_name),
                     "FileIsDirectory": os.path.isdir(file_name),
                     "ConvertMediaFormats": 0,
@@ -299,11 +312,12 @@ class AirDropClient:
         if is_url:
             ask_body["Items"] = file_path
         else:
-            # generate icon for first file
+            # The icon stays the first file's - one transfer, one thumbnail.
+            # Only the icon is decided here now; the per-entry types are sniffed
+            # in file_entries above.
             with open(file_path[0], "rb") as f:
-                file_header = f.read(128)
-                flp = fleep.get(file_header)
-                if not icon and len(flp.mime) > 0 and "image" in flp.mime[0]:
+                first_flp = fleep.get(f.read(128))
+                if not icon and len(first_flp.mime) > 0 and "image" in first_flp.mime[0]:
                     icon = AirDropUtil.generate_file_icon(f.name)
             ask_body["Files"] = [e for e in file_entries(file_path)]
         if icon:
@@ -357,8 +371,13 @@ class AirDropClient:
 
     def send_upload(self, file_path, is_url=False, reask=None):
         """
-        Send a file to a receiver.
+        Send one or more files to a receiver.
+
+        `file_path` takes a string or a list, as send_ask does, so both
+        halves of one transfer can be fed from the same value.
         """
+        if isinstance(file_path, str):
+            file_path = [file_path]
         # Don't send an upload request if we just sent a link
         if is_url:
             return
@@ -510,7 +529,12 @@ class AirDropClient:
                 filter_name="gzip" if compress else None,
                 archive_write_class=AbsArchiveWrite,
             ) as archive:
-                for f in [file_path]:
+                # The list as given, not `[file_path]`. send_ask already
+                # announces one entry per file in a single /Ask; wrapping it
+                # here made this path unusable and forced the caller into
+                # one transfer per file, and so one Accept per file on the
+                # phone.
+                for f in file_path:
                     ff = os.path.basename(f)
                     archive.add_abs_file(f, os.path.join(".", ff))
             payload = stream.getvalue()

@@ -40,7 +40,14 @@ class AirDropCli:
     def __init__(self, args):
         parser = argparse.ArgumentParser()
         parser.add_argument("action", choices=["receive", "find", "send"])
-        parser.add_argument("-f", "--file", help="File to be sent")
+        # REPEATABLE. The protocol carries several files in ONE transfer -
+        # send_ask already builds one entry per file - but the command line
+        # could not say so, so every caller had to loop around it: N
+        # transfers, N Accepts on the phone. `-f a -f b` makes that one.
+        # A single -f is still a one-element list, so nothing changes for
+        # existing callers.
+        parser.add_argument("-f", "--file", action="append", metavar="FILE",
+                            help="File to be sent; repeat for several")
         parser.add_argument(
             "-u", "--url", help="'-f,--file is a URL", action="store_true"
         )
@@ -100,10 +107,14 @@ class AirDropCli:
             elif args.action == "find":
                 self.find()
             else:  # args.action == 'send'
-                if args.file is None:
+                if not args.file:
                     parser.error("Need -f,--file when using send")
-                if not os.path.isfile(args.file) and not args.url:
-                    parser.error("File in -f,--file not found")
+                if args.url and len(args.file) > 1:
+                    parser.error("-u,--url takes a single -f,--file")
+                if not args.url:
+                    for path in args.file:
+                        if not os.path.isfile(path):
+                            parser.error("File in -f,--file not found: %s" % path)
                 self.file = args.file
                 self.is_url = args.url
                 if args.receiver is None:
