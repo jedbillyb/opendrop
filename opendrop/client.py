@@ -136,6 +136,21 @@ class AirDropBrowser:
         if self.callback_add is not None:
             self.callback_add(info)
 
+    def update_service(self, zeroconf, service_type, name):
+        # Required on a listener since python-zeroconf 0.3x. Without it the
+        # AttributeError is raised INSIDE the ServiceBrowser thread and kills
+        # it: the process stays up, the listener object is still there, and
+        # discovery simply never reports anything again.
+        #
+        # It matters more than a missing stub usually would, because a device
+        # that re-announces itself - which is exactly what the receiver you
+        # are waiting for does - fires update rather than add. So the one
+        # event you need is the one that takes the thread down.
+        info = zeroconf.get_service_info(service_type, name)
+        logger.debug(f"Update service {name}")
+        if self.callback_add is not None:
+            self.callback_add(info)
+
     def remove_service(self, zeroconf, service_type, name):
         info = zeroconf.get_service_info(service_type, name)
         logger.debug(f"Remove service {name}")
