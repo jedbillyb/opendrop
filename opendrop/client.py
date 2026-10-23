@@ -24,6 +24,7 @@ import os
 import platform
 import plistlib
 import socket
+import ssl
 from http.client import HTTPSConnection
 
 import fleep
@@ -263,15 +264,30 @@ class HTTPSConnectionAWDL(HTTPSConnection):
         if timeout is None:
             timeout = socket.getdefaulttimeout()
 
+        # key_file, cert_file and check_hostname were deprecated on
+        # HTTPSConnection from Python 3.6 and REMOVED in 3.12, so forwarding them
+        # raises e.g.
+        #   TypeError: HTTPSConnection.__init__() got an unexpected keyword
+        #              argument 'key_file'
+        # and every send/find dies before a single packet goes out. All three now
+        # live on the SSLContext instead. AirDropConfig.get_ssl_context() already
+        # does the load_cert_chain(), so in normal use key_file/cert_file are None
+        # and there is nothing to carry over. They stay in the signature for
+        # callers that still pass them.
+        if context is None and (key_file or cert_file):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.load_cert_chain(cert_file, keyfile=key_file)
+        if check_hostname is not None and context is not None:
+            context.check_hostname = check_hostname
+
         super(HTTPSConnectionAWDL, self).__init__(
             host=host,
             port=port,
-            key_file=key_file,
-            cert_file=cert_file,
             timeout=timeout,
             source_address=source_address,
             context=context,
-            check_hostname=check_hostname,
         )
 
         self.interface_name = interface_name

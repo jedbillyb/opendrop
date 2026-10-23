@@ -111,13 +111,17 @@ class AirDropUtil:
             pass  # no EXIF data available
 
         # Big image
-        im.thumbnail((540, 540), Image.ANTIALIAS)
+        # Image.ANTIALIAS was deprecated in Pillow 2.7 and REMOVED in 10.0;
+        # Image.Resampling.LANCZOS is the same filter under its current name.
+        # Without this, sending any image dies in send_ask() with
+        #   AttributeError: module 'PIL.Image' has no attribute 'ANTIALIAS'
+        im.thumbnail((540, 540), Image.Resampling.LANCZOS)
         img_bytes = io.BytesIO()
         im.save(img_bytes, format="JPEG2000")
         file_icon = img_bytes.getvalue()
 
         # Small image
-        # im.thumbnail((64, 64), Image.ANTIALIAS)
+        # im.thumbnail((64, 64), Image.Resampling.LANCZOS)
         # img_bytes = io.BytesIO()
         # im.save(img_bytes, format='JPEG2000')
         # small_file_icon = img_bytes.getvalue()
@@ -180,27 +184,37 @@ class AbsArchiveWrite(ArchiveWrite):
         if block_size <= 0:
             block_size = 10240  # pragma: no cover
 
-        with new_archive_entry() as entry_p:
-            entry = ArchiveEntry(None, entry_p)
-            with new_archive_read_disk(path) as read_p:
-                while True:
-                    r = read_next_header2(read_p, entry_p)
-                    if r == ARCHIVE_EOF:
-                        break
-                    entry.pathname = store_path
-                    read_disk_descend(read_p)
-                    write_header(write_p, entry_p)
-                    try:
-                        with open(entry_sourcepath(entry_p), "rb") as f:
-                            while True:
-                                data = f.read(block_size)
-                                if not data:
-                                    break
-                                write_data(write_p, data, len(data))
-                    except IOError as e:
-                        if e.errno != 21:
-                            raise  # pragma: no cover
-                    write_finish_entry(write_p)
-                    entry_clear(entry_p)
-                    if os.path.isdir(path):
-                        break
+        # libarchive-c changed ArchiveEntry's signature: the second positional
+        # argument is now `header_codec` (a str), not an entry pointer, and the
+        # entry allocates its own C struct in __init__. The old call
+        # `ArchiveEntry(None, entry_p)` therefore stuffed a pointer into
+        # header_codec and blew up on the first pathname assignment with
+        #   TypeError: encode() argument 'encoding' must be str, not int
+        # Let the ArchiveEntry own its struct and use that pointer throughout.
+        # This deliberately drops the old `new_archive_entry()` context manager:
+        # it would free the same struct that ArchiveEntry.__del__ frees, which is
+        # a double free.
+        entry = ArchiveEntry(None, "utf-8")
+        entry_p = entry._entry_p
+        with new_archive_read_disk(path) as read_p:
+            while True:
+                r = read_next_header2(read_p, entry_p)
+                if r == ARCHIVE_EOF:
+                    break
+                entry.pathname = store_path
+                read_disk_descend(read_p)
+                write_header(write_p, entry_p)
+                try:
+                    with open(entry_sourcepath(entry_p), "rb") as f:
+                        while True:
+                            data = f.read(block_size)
+                            if not data:
+                                break
+                            write_data(write_p, data, len(data))
+                except IOError as e:
+                    if e.errno != 21:
+                        raise  # pragma: no cover
+                write_finish_entry(write_p)
+                entry_clear(entry_p)
+                if os.path.isdir(path):
+                    break
