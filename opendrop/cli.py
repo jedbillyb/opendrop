@@ -33,7 +33,15 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    AirDropCli(sys.argv[1:])
+    """Returns a process exit status, which the console script propagates.
+
+    Nothing here used to: every failure path in send() was a bare `return`
+    and main() returned None, so `opendrop send` exited 0 whether the
+    receiver declined, the upload broke, or no such receiver existed. Every
+    caller that reads the status - a wrapper script, a desktop notification,
+    a progress indicator - was therefore told the transfer worked.
+    """
+    return AirDropCli(sys.argv[1:]).status
 
 
 class AirDropCli:
@@ -100,6 +108,7 @@ class AirDropCli:
         self.sending_started = False
         self.discover = []
         self.lock = threading.Lock()
+        self.status = 0
 
         try:
             if args.action == "receive":
@@ -120,7 +129,7 @@ class AirDropCli:
                 if args.receiver is None:
                     parser.error("Need -r,--receiver when using send")
                 self.receiver = args.receiver
-                self.send()
+                self.status = self.send() or 0
         except KeyboardInterrupt:
             if self.browser is not None:
                 self.browser.stop()
@@ -223,14 +232,15 @@ class AirDropCli:
         self.server.start_server()
 
     def send(self):
+        """0 when the file landed, 1 otherwise. See main()."""
         info = self._get_receiver_info()
         if info is None:
-            return
+            return 1
         self.client = AirDropClient(self.config, (info["address"], info["port"]))
         logger.info("Asking receiver to accept ...")
         if not self.client.send_ask(self.file, is_url=self.is_url):
             logger.warning("Receiver declined")
-            return
+            return 1
         logger.info("Receiver accepted")
         logger.info("Uploading file ...")
         if not self.client.send_upload(
@@ -242,8 +252,9 @@ class AirDropCli:
             reask=lambda: self.client.send_ask(self.file, is_url=self.is_url),
         ):
             logger.warning("Uploading has failed")
-            return
+            return 1
         logger.info("Uploading has been successful")
+        return 0
 
     def _get_receiver_info(self):
         if not os.path.exists(self.config.discovery_report):
