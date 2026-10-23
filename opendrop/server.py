@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import io
 import json
 import logging
+import mmap
 import os
 import platform
 import plistlib
@@ -280,6 +281,16 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     config = None
 
+    # A timeout on EVERY socket read, not only on an upload body.
+    #
+    # handle_ask reads the request body BEFORE calling the consent hook: when
+    # the phone's AWDL goes to sleep at exactly that moment, the read blocks
+    # forever, no prompt is offered, nothing is logged, and the phone
+    # eventually shows a refusal. Observed live on an /Ask left unanswered.
+    # socketserver applies this attribute to each request's socket, so it
+    # covers /Discover and /Ask as much as /Upload.
+    timeout = float(os.environ.get("AIRDROP_STALL_TIMEOUT", "30"))
+
     def _set_response(self, content_length):
         """
         Setting the default values for a successful response
@@ -439,7 +450,26 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         return True
 
     def handle_ask(self):
-        post_data = self._read_request_body()
+        try:
+            post_data = self._read_request_body()
+        except (socket.timeout, TimeoutError):
+            # Without this the exception escapes into the request thread: the
+            # phone gets nothing and the user never sees the prompt at all.
+            #
+            # And returning is not enough: with no status and no close, a
+            # keep-alive connection is left open, the handler stays busy
+            # waiting for a following request until another timeout, and the
+            # phone never learns it was refused. So terminate explicitly.
+            logger.warning("sender went quiet during /Ask - no prompt shown")
+            try:
+                self.send_response(408)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            except OSError:
+                pass
+            self.close_connection = True
+            return
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
 
@@ -560,9 +590,24 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                         break
                     payload = f.read(length)
                     if len(payload) < length:
-                        raise ValueError(
-                            f"dvzip block truncated: wanted {length}, got {len(payload)}"
-                        )
+                        # A truncated block is NOT a lost file. Measured over
+                        # 17 interrupted transfers: 9 of them already held the
+                        # complete cpio and had lost only the container's
+                        # terminator - the extracted JPEG matched the sender's
+                        # sha256 exactly. Raising here therefore threw whole
+                        # files away. Keep what arrived and let extraction
+                        # decide what is usable.
+                        logger.warning(
+                            f"dvzip block truncated (wanted {length}, got "
+                            f"{len(payload)}) - salvaging what arrived")
+                        if stored:
+                            out += payload
+                        else:
+                            try:
+                                out += zlib.decompressobj().decompress(payload)
+                            except zlib.error as exc:
+                                logger.warning(f"  tail block unusable ({exc})")
+                        break
                     out += payload if stored else zlib.decompress(payload)
             return bytes(out)
 
@@ -590,24 +635,232 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", 0)
                 self.end_headers()
 
-            while True:
-                buf = reader.read(65536)
-                if not buf:
+            # A read timeout. _next_chunk blocked in readline() with no
+            # deadline: when the phone stops transmitting - which happens near
+            # the end, regularly, on this link - the loop never ended, the
+            # `with` never closed, and even the bytes already received stayed
+            # in the write buffer. The value is wide compared to the measured
+            # AWDL jitter (RTT ~400 ms, bursts ~450 ms apart) so that a merely
+            # slow transfer is not cut off.
+            stall = float(os.environ.get("AIRDROP_STALL_TIMEOUT", "30"))
+            floor = float(os.environ.get("AIRDROP_STALL_FLOOR", "8"))
+
+            # THE TIMEOUT FOLLOWS THE LINK'S RHYTHM; it is not a constant.
+            #
+            # A flat 30 s is added to EVERY salvaged transfer: of one measured
+            # 43 s transfer, thirty were spent waiting on a sender that had
+            # already gone quiet. But it cannot simply be shortened - the link
+            # delivers in bursts, and cutting off a slow transfer would be
+            # worse than waiting.
+            #
+            # First attempt, abandoned: trigger a short tier once close to
+            # TotalBytes. That assumes the sender always stops at the edge,
+            # which is false - measured, stops range from 440 bytes to 943,642
+            # bytes short, 0.03% to 24%. No threshold covers both.
+            #
+            # So it no longer guesses where the end is: it watches the gap
+            # between successful reads and waits a large multiple of the worst
+            # gap seen so far. A steady link drops to the floor within
+            # seconds; a choppy one lets the timeout climb on its own. The
+            # floor stays ten times above the measured burst spacing (~450 ms,
+            # 772 ms jitter), and the ceiling is the old value, so it can
+            # never wait LONGER than before.
+            _arm = lambda sec: self.connection.settimeout(sec)
+            try:
+                _arm(stall)
+            except OSError:
+                _arm = lambda sec: None
+
+            armed = stall
+            worst = 0.0
+            last = time.monotonic()
+            try:
+                while True:
+                    buf = reader.read(65536)
+                    if not buf:
+                        break
+                    raw.write(buf)
+
+                    now = time.monotonic()
+                    gap, last = now - last, now
+                    if gap > worst:
+                        worst = gap
+                        want = min(max(worst * 6.0, floor), stall)
+                        # Only re-arm on a real change: calling settimeout on
+                        # every 64 KiB block would be one syscall per block for
+                        # nothing.
+                        if abs(want - armed) > 0.5:
+                            try:
+                                _arm(want)
+                            except OSError:
+                                pass
+                            armed = want
+            except (socket.timeout, TimeoutError):
+                logger.warning(
+                    f"sender went quiet for {armed:.0f}s after {reader.total} B "
+                    f"(worst gap seen {worst:.1f}s) - salvaging what arrived")
+            except (ConnectionResetError, ValueError) as exc:
+                logger.warning(f"upload stream broke ({exc}) - salvaging")
+            finally:
+                raw.flush()
+                os.fsync(raw.fileno())
+
+        def odc_members(cpio):
+            """(name, data_is_complete, is_regular) for each ODC cpio member.
+
+            ODC header: 76 fixed-width ASCII bytes, then the name (namesize,
+            NUL included), then the data (filesize), all octal. The structure
+            is walked by hand because libarchive ZERO-PADS a truncated member
+            out to its declared size: measured, a JPEG handed back at exactly
+            the right length ended in 949,265 null bytes with no end marker.
+            Comparing sizes therefore detects nothing at all - only the bytes
+            actually being present in the archive proves anything.
+            """
+            out, off, n = [], 0, len(cpio)
+            while off + 76 <= n:
+                if cpio[off:off + 6] != b"070707":
                     break
-                raw.write(buf)
+                try:
+                    # ODC fields sit at fixed offsets: magic(6) dev(6) ino(6)
+                    # mode(6) ... namesize at 59, filesize at 65.
+                    mode = int(cpio[off + 18:off + 24], 8)
+                    namesize = int(cpio[off + 59:off + 65], 8)
+                    filesize = int(cpio[off + 65:off + 76], 8)
+                except ValueError:
+                    break
+                # These fields come from the network. int(..., 8) accepts a
+                # leading minus, and a negative filesize leaves `off` where it
+                # was: the loop then spins forever IN THE REQUEST THREAD, on a
+                # file crafted for it. A zero namesize does not advance either.
+                if namesize <= 0 or filesize < 0:
+                    break
+                name_off = off + 76
+                name = cpio[name_off:name_off + namesize].split(b"\0")[0]
+                name = name.decode("utf-8", "replace")
+                data_off = name_off + namesize
+                if name == "TRAILER!!!":
+                    break
+                # The mode matters. An iOS archive starts with the WRAPPER
+                # DIRECTORY, which has no data and is therefore always
+                # "complete" - even in a transfer cut off at the first block.
+                # Without this filter that directory alone was enough to make
+                # the list of valid members non-empty, and so to have the raw
+                # bytes deleted when not one file had been recovered. That is
+                # the .partial guarantee falling over.
+                regular = (mode & 0o170000) == 0o100000
+                out.append((name, data_off + filesize <= n, regular))
+                off = data_off + filesize
+            return out
+
+        def verify_extracted(cpio_bytes):
+            """Separate what arrived whole from what did not.
+
+            Incomplete members get a .partial suffix: silently delivering a
+            half-empty photo that still opens would be worse than an honest
+            failure.
+            """
+            good, bad = [], []
+            for name, complete, regular in odc_members(cpio_bytes):
+                base = os.path.basename(name)
+                if not base or base == "." or base.startswith("._"):
+                    continue
+                if not regular:
+                    continue   # wrapper directory: proves nothing
+                # The member name is chosen by the peer. Joined as is, a
+                # ../../ escapes the receive directory - and that path reaches
+                # os.replace() below, so an arbitrary file of the user's would
+                # be renamed. Resolve it and require the result to stay under
+                # the current directory.
+                root = os.path.realpath(os.getcwd())
+                path = os.path.realpath(os.path.join(root, name))
+                if path != root and not path.startswith(root + os.sep):
+                    logger.warning(f"refusing member outside the receive dir: {name}")
+                    continue
+                if not os.path.exists(path):
+                    continue
+                if complete:
+                    good.append(base)
+                else:
+                    bad.append(base)
+                    try:
+                        os.replace(path, path + ".partial")
+                    except OSError:
+                        pass
+            return good, bad
 
         try:
             if raw_path.endswith(".dvzip"):
-                libarchive.extract_memory(dvzip_to_cpio(raw_path))
+                cpio_bytes = dvzip_to_cpio(raw_path)
+                try:
+                    libarchive.extract_memory(cpio_bytes)
+                except Exception as e:  # noqa: BLE001
+                    # A truncated archive raises AFTER writing the complete
+                    # members, so nothing already on disk is lost.
+                    logger.warning(f"archive ended early ({e}) - checking what landed")
+                good, bad = verify_extracted(cpio_bytes)
+                if bad:
+                    logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+                if not good:
+                    raise ValueError("no complete file in the transfer")
+                logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+                os.remove(raw_path)
             else:
-                with open(raw_path, "rb") as raw:
-                    extract_stream(raw)
+                # THE SAME VERIFICATION AS FOR dvzip. This path used to extract
+                # and then delete the raw bytes without checking anything - and
+                # libarchive zero-pads a truncated member here too, so an
+                # interrupted cpio came out "successful" with a file full of
+                # zeros and its source destroyed. The .partial guarantee only
+                # held for dvzip.
+                #
+                # The extraction failure stays LOCAL: on a cut archive
+                # libarchive can raise after writing whole members, and letting
+                # that reach the outer handler left those files unclassified -
+                # so incomplete ones were never renamed .partial. Verify in
+                # every case.
+                try:
+                    with open(raw_path, "rb") as raw:
+                        extract_stream(raw)
+                except Exception as exc:  # noqa: BLE001 - verification decides
+                    logger.warning(f"archive ended early ({exc}) - checking what landed")
+
+                # x-cpio uploads are GZIP-COMPRESSED - opendrop's own sender
+                # builds them with filter_name="gzip". Walking the raw bytes
+                # for the ODC magic therefore finds nothing, `good` comes back
+                # empty, and a perfectly good transfer is reported as "no
+                # complete file" with its raw file kept beside the extracted
+                # ones. Decompress first when the gzip magic is there.
+                #
+                # mmap rather than read() on the uncompressed path: it used to
+                # stream, and loading it whole doubled the footprint on a 45 MB
+                # video. odc_members only ever slices, so a mapping is enough.
+                with open(raw_path, "rb") as fh:
+                    size = os.fstat(fh.fileno()).st_size
+                    if not size:
+                        good, bad = [], []
+                    elif fh.read(2) == b"\x1f\x8b":
+                        # Not GzipFile.read(): on a cut-off transfer the gzip
+                        # stream is truncated too, and read() raises EOFError.
+                        # That skipped verification entirely, so the
+                        # zero-padded members libarchive had written were never
+                        # renamed .partial. A raw decompressobj returns every
+                        # byte that did arrive without raising, and
+                        # odc_members already reads a short buffer as
+                        # incomplete members.
+                        fh.seek(0)
+                        gz = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        good, bad = verify_extracted(gz.decompress(fh.read()))
+                    else:
+                        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as cpio_bytes:
+                            good, bad = verify_extracted(cpio_bytes)
+                if bad:
+                    logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+                if not good:
+                    raise ValueError("no complete file in the transfer")
+                logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+                os.remove(raw_path)
         except Exception as e:  # noqa: BLE001 - any failure here must not lose the bytes
             logger.warning(f"Could not extract the archive ({e}).")
             logger.warning(f"The raw transfer is kept at {raw_path}")
-        else:
-            logger.info(f"Extracted into {os.getcwd()}")
-            os.remove(raw_path)
 
         transferred = reader.total / 1024.0 / 1024.0
         speed = transferred / (time.time() - start)
