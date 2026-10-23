@@ -222,7 +222,14 @@ class AirDropCli:
             return
         logger.info("Receiver accepted")
         logger.info("Uploading file ...")
-        if not self.client.send_upload(self.file, is_url=self.is_url):
+        if not self.client.send_upload(
+            self.file,
+            is_url=self.is_url,
+            # Lets an upload arm re-establish an accepted session before it runs.
+            # Without this every arm after the first tests a fresh connection the
+            # phone never accepted anything on.
+            reask=lambda: self.client.send_ask(self.file, is_url=self.is_url),
+        ):
             logger.warning("Uploading has failed")
             return
         logger.info("Uploading has been successful")

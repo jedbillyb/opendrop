@@ -17,6 +17,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import base64
 import io
 import ipaddress
 import logging
@@ -25,8 +26,12 @@ import platform
 import plistlib
 import socket
 import ssl
+import struct
 import threading
-from http.client import HTTPSConnection
+import time
+import uuid
+import zlib
+from http.client import HTTPException, HTTPSConnection
 
 import fleep
 import libarchive
@@ -144,18 +149,45 @@ class AirDropClient:
         self.receiver_host = receiver[0]
         self.receiver_port = receiver[1]
         self.http_conn = None
+        # Sender identity for the Apple /Upload headers. Generated once per
+        # client so a retried arm reuses the same values, and shaped to match
+        # what the phone sends: a UUID in upper case, a "pseud:" prefix followed
+        # by 22 characters of base64 (16 bytes, unpadded), and a 32-byte token
+        # in upper-case hex. We have no Apple ID, so the pseudonym and token
+        # cannot be real - the open question is whether the receiver merely
+        # requires them to be present and well formed.
+        self._transfer_id = str(uuid.uuid4()).upper()
+        self._pseudonym = "pseud:" + base64.b64encode(os.urandom(16)).decode().rstrip(
+            "="
+        ).replace("+", "-").replace("/", "_")
+        self._push_token = os.urandom(32).hex().upper()
+        # Filled in by send_ask from the receiver's /Ask reply (FINDINGS §37).
+        self._ask_response = {}
 
-    def send_POST(self, url, body, headers=None):
+    def send_POST(
+        self, url, body, headers=None, new_conn=False, minimal=False, raw=False
+    ):
         logger.debug(f"Send {url} request")
 
         AirDropUtil.write_debug(
             self.config, body, f"send_{url.lower().strip('/')}_request.plist"
         )
 
-        _headers = self._get_headers()
+        # `minimal` drops upstream's Accept/Accept-Language/Accept-Encoding.
+        # Measured on 2026-07-31 by logging what the iPhone sends US: its
+        # /Discover and /Ask carry exactly three headers - User-Agent,
+        # Connection, Transfer-Encoding - and no Accept*, no Content-Type and no
+        # Host. Upstream sends seven. See FINDINGS §33.
+        _headers = {} if minimal else self._get_headers()
         if headers is not None:
             for key, val in headers.items():
                 _headers[key] = val
+        if new_conn and self.http_conn is not None:
+            try:
+                self.http_conn.close()
+            except OSError:
+                pass
+            self.http_conn = None
         if self.http_conn is None:
             # Use single connection
             self.http_conn = HTTPSConnectionAWDL(
@@ -164,7 +196,25 @@ class AirDropClient:
                 interface_name=self.config.interface,
                 context=self.config.get_ssl_context(),
             )
-        self.http_conn.request("POST", url, body=body, headers=_headers)
+        if raw:
+            # Byte-for-byte control of the request line and headers.
+            # http.client.request() always inserts Host and Accept-Encoding,
+            # and an iOS 26 sender emits neither (§34/§35). It also reorders
+            # headers, and Apple's order is fixed. putrequest() can suppress
+            # both insertions; the chunked framing is then ours to write, which
+            # is a handful of bytes.
+            self.http_conn.putrequest(
+                "POST", url, skip_host=True, skip_accept_encoding=True
+            )
+            for key, val in _headers.items():
+                self.http_conn.putheader(key, val)
+            self.http_conn.endheaders()
+            payload = body if isinstance(body, bytes) else body.read()
+            self.http_conn.send(
+                b"%x\r\n" % len(payload) + payload + b"\r\n0\r\n\r\n"
+            )
+        else:
+            self.http_conn.request("POST", url, body=body, headers=_headers)
         http_resp = self.http_conn.getresponse()
 
         response_bytes = http_resp.read()
@@ -203,6 +253,16 @@ class AirDropClient:
             "SenderModelName": self.config.computer_model,
             "SenderID": self.config.service_id,
             "ConvertMediaFormats": False,
+            # DECLARE THE TRANSFER ID IN THE ASK BODY. Captured from a real iOS 26
+            # sender's /Ask (FINDINGS §37): the sender announces the transfer here
+            # as a dict {'id': UUID} and then repeats the SAME id in the /Upload
+            # TransferID header. The receiver correlates the two. Our sender used
+            # to invent a fresh id on /Upload that /Ask never announced, so the
+            # phone had no accepted transfer to bind it to and refused on the
+            # headers ~31 ms in, before reading the body - the exact refusal shape
+            # we saw all evening. This value must equal the /Upload TransferID.
+            "TransferID": {"id": self._transfer_id},
+            "TransferType": {"files": {}},
         }
         if self.config.record_data:
             ask_body["SenderRecordData"] = self.config.record_data
@@ -237,11 +297,50 @@ class AirDropClient:
         ask_binary = plistlib.dumps(
             ask_body, fmt=plistlib.FMT_BINARY  # pylint: disable=no-member
         )
-        success, _ = self.send_POST("/Ask", ask_binary)
+        success, response_bytes = self.send_POST("/Ask", ask_binary)
+
+        # Keep whatever the receiver handed back. A real iOS 26 receiver answers
+        # /Ask with a plist carrying IDSSessionID, ReceiverPseudonym and
+        # ReceiverPushToken (FINDINGS §37) - values an Apple sender may be
+        # expected to echo on /Upload, and which we can only obtain from this
+        # reply. Parsed leniently: an empty or non-plist body must not break the
+        # send.
+        self._ask_response = {}
+        if response_bytes:
+            try:
+                self._ask_response = plistlib.loads(response_bytes)
+            except Exception:
+                pass
 
         return success
 
-    def send_upload(self, file_path, is_url=False):
+    @staticmethod
+    def _cpio_to_dvzip(cpio, block=128 * 1024, stored=False):
+        """
+        Wrap a cpio archive in Apple's dvzip container.
+
+        The exact inverse of dvzip_to_cpio() in server.py, which was verified
+        against a real 2.06 MB iOS 26 transfer (17 blocks, file consumed
+        exactly). Each block is:
+
+            [4-byte big-endian header][payload]
+
+        Bit 31 of the header set means the payload is STORED; clear means it is
+        a zlib stream. The low 31 bits are the payload length as it appears on
+        the wire. Blocks hold 128 KiB of *decompressed* data except the last.
+        There is no trailer - the decoder stops at EOF.
+        """
+        out = bytearray()
+        for off in range(0, len(cpio), block):
+            chunk = cpio[off : off + block]
+            if stored:
+                out += struct.pack(">I", 0x80000000 | len(chunk)) + chunk
+            else:
+                z = zlib.compress(chunk)
+                out += struct.pack(">I", len(z)) + z
+        return bytes(out)
+
+    def send_upload(self, file_path, is_url=False, reask=None):
         """
         Send a file to a receiver.
         """
@@ -249,29 +348,250 @@ class AirDropClient:
         if is_url:
             return
 
-        headers = {
-            "Content-Type": "application/x-cpio",
-        }
+        # WHY ARMS. An iPhone on iOS 26 accepts /Ask, returns a full 200 with its
+        # receiver plist, then takes a complete, well-formed chunked /Upload and
+        # answers with a TLS close_notify instead of an HTTP status. It is not
+        # transport loss - captured at 0% ping loss, every byte ACKed. A server
+        # that dislikes a media type answers 406; a silent close points at
+        # framing or connection handling, and one capture cannot say which.
+        #
+        # Each arm costs the user an Accept tap if tested across separate runs,
+        # so they are tried in sequence within one accepted session instead. The
+        # asymmetry to remember when reading the result: a SUCCESS is conclusive,
+        # a FAILURE of a later arm is not, because the phone may have abandoned
+        # the session after the first rejection.
+        # The second round of arms is no longer guesswork. We have watched this
+        # phone send /Upload to US, and it differs from what we send in two
+        # observed ways: it sets `Expect: 100-continue` (our receiver had to be
+        # taught to answer it - see FINDINGS on the 100-continue ordering) and it
+        # wraps the cpio in an `application/x-dvzip` container. Copying what
+        # Apple demonstrably does beats inventing a fifth theory.
+        #
+        # These all hold the connection constant (reused, as upstream does),
+        # because the first round confounded connection reuse with framing and
+        # so could not attribute its failures. Only arm 1 was interpretable.
+        arms = os.environ.get(
+            "OPENDROP_UPLOAD_ARMS",
+            # Round four. dvzip and Expect are eliminated - three valid arms in
+            # §30's successor all drew an identical close_notify, one of them
+            # 70 microseconds after our headers, far too fast for the body to
+            # have been read. That timing says the request is refused on its
+            # HEADERS.
+            #
+            # The discriminator was already in our own captures. On the very
+            # same connection:
+            #
+            #   POST /Ask     Content-Length: 333        -> 200, every run
+            #   POST /Upload  Transfer-Encoding: chunked -> close_notify, always
+            #
+            # plistlib.dumps() returns bytes so http.client sets a length, while
+            # send_upload handed it a BytesIO, which forces chunked. Nothing
+            # else differs. Our own receiver needed chunked support ADDED for
+            # /Discover and /Ask, so iOS sending chunked as a client never
+            # implied it accepts chunked as a server.
+            #
+            # CANDIDATE FIRST, control last. Normally the control leads, but the
+            # control here has been reproduced in every run of the evening,
+            # three of them fully valid arms, so re-proving it is not worth what
+            # it costs: arm 1 rides the /Ask that cli.send() already made, while
+            # every later arm needs a fresh /Ask - another prompt, another tap,
+            # and another chance for the re-Ask to die on a flaky link, which is
+            # exactly what killed the previous run. Putting the untested arm
+            # first buys the answer for one tap and no re-Ask.
+            # §33: the phone sends three headers, we send seven. The minimal
+            # arms come first because that is the largest untested difference.
+            # §34: the phone's /Upload carries TotalBytes, TransferID,
+            # SenderPseudonym and SenderPushToken. "applehdr" sends all four,
+            # with dvzip and chunked, which is now a full copy of an observed
+            # Apple upload rather than a theory about one.
+            # §35: applehdr sent all four Apple headers and was still refused,
+            # and the capture showed http.client had added Host and
+            # Accept-Encoding, which Apple never sends. "rawhdr" emits Apple's
+            # exact header set in Apple's exact order with neither of those.
+            # That is the last difference left under our control.
+            # Round five. §37 changed the question. Every arm to date sent a
+            # /Upload TransferID that the /Ask never announced, so all of them
+            # were malformed in the same way and none could have succeeded - the
+            # earlier "eliminations" only proved the receiver rejects an
+            # unannounced transfer, not that any container or framing is wrong.
+            # send_ask now declares TransferID in the /Ask body exactly as a real
+            # iOS 26 sender does, and this single arm is a byte-level copy of the
+            # observed Apple /Upload: reused connection, chunked, dvzip container,
+            # Apple's exact header set and order (rawhdr), carrying the announced
+            # TransferID. One arm, one tap. A success is the whole goal; a failure
+            # now isolates the remaining difference to SenderRecordData, the
+            # Apple-signed Apple-ID validation record we cannot forge.
+            "reuse-chunked-dvzip-rawhdr",
+        ).split(",")
 
-        # Create archive in memory ...
-        stream = io.BytesIO()
-        with libarchive.custom_writer(
-            stream.write,
-            "cpio",
-            filter_name="gzip",
-            archive_write_class=AbsArchiveWrite,
-        ) as archive:
-            for f in [file_path]:
-                ff = os.path.basename(f)
-                archive.add_abs_file(f, os.path.join(".", ff))
-        stream.seek(0)
+        for i, arm in enumerate(arms):
+            arm = arm.strip()
+            if not arm:
+                continue
+            # RE-ASK BEFORE EVERY ARM AFTER THE FIRST. Twice now an arms round
+            # has produced four failures of which only the first was
+            # interpretable, because a refused /Upload leaves the connection
+            # dead: send_POST then finds http_conn is None and opens a fresh one,
+            # so "reuse" silently becomes "new" and the arm is a different
+            # experiment from the one it claims to be. Worse, that fresh
+            # connection carries no /Ask, so the phone is being asked to accept
+            # an upload for a session it never agreed to on that socket.
+            #
+            # The only honest fix costs the user an Accept tap per arm. Taps are
+            # cheaper than another uninterpretable round.
+            if i > 0:
+                if reask is None:
+                    logger.warning(
+                        f"Skipping arm '{arm}': the connection is gone and there "
+                        "is no way to re-Ask, so the arm would not test what its "
+                        "name says."
+                    )
+                    continue
+                logger.info(f"Re-sending /Ask before arm '{arm}' - EXPECT A PROMPT")
+                if self.http_conn is not None:
+                    try:
+                        self.http_conn.close()
+                    except OSError:
+                        pass
+                    self.http_conn = None
+                # Retry the re-Ask. A single reset here is usually the AWDL link
+                # rather than a decision by the phone (§28: our TX drops out in
+                # bursts), and giving up on it wastes a run that has already cost
+                # the user a share sheet and a tap.
+                asked = False
+                for attempt in range(3):
+                    try:
+                        if reask():
+                            asked = True
+                            break
+                        logger.warning(f"Re-Ask before '{arm}' was refused")
+                        break  # a considered "no" is not worth retrying
+                    except (OSError, HTTPException) as e:
+                        logger.warning(
+                            f"Re-Ask before '{arm}' failed at the socket "
+                            f"(attempt {attempt + 1}/3): {e}"
+                        )
+                        if self.http_conn is not None:
+                            try:
+                                self.http_conn.close()
+                            except OSError:
+                                pass
+                            self.http_conn = None
+                        time.sleep(2)
+                if not asked:
+                    logger.warning(f"Could not re-Ask before '{arm}'; stopping")
+                    return False
+            new_conn = arm.startswith("new")
+            use_length = "length" in arm
+            compress = "plain" not in arm and "dvzip" not in arm
+            dvzip = "dvzip" in arm
+            expect = "expect" in arm
 
-        # ... then send in chunked mode
-        success, _ = self.send_POST("/Upload", stream, headers=headers)
+            # Create archive in memory ...
+            stream = io.BytesIO()
+            with libarchive.custom_writer(
+                stream.write,
+                "cpio",
+                filter_name="gzip" if compress else None,
+                archive_write_class=AbsArchiveWrite,
+            ) as archive:
+                for f in [file_path]:
+                    ff = os.path.basename(f)
+                    archive.add_abs_file(f, os.path.join(".", ff))
+            payload = stream.getvalue()
 
-        # TODO better: write archive chunk whenever send_POST does a read to avoid having the whole archive in memory
+            if dvzip:
+                payload = self._cpio_to_dvzip(payload)
 
-        return success
+            minimal = "minhdr" in arm or "applehdr" in arm or "rawhdr" in arm
+            raw = "rawhdr" in arm
+            headers = {}
+            if raw:
+                # Apple's exact set, in Apple's exact order (§34). dicts preserve
+                # insertion order, and send_POST emits them in that order when
+                # raw is set, so this literally reproduces the observed request.
+                headers["User-Agent"] = "AirDrop/1.0"
+                headers["TotalBytes"] = str(len(payload))
+                headers["Content-Type"] = (
+                    "application/x-dvzip" if dvzip else "application/x-cpio"
+                )
+                headers["SenderPseudonym"] = self._pseudonym
+                headers["SenderPushToken"] = self._push_token
+                headers["TransferID"] = self._transfer_id
+                headers["Connection"] = "keep-alive"
+                headers["Transfer-Encoding"] = "chunked"
+            else:
+                headers["Content-Type"] = (
+                    "application/x-dvzip" if dvzip else "application/x-cpio"
+                )
+            if "applehdr" in arm:
+                # The four headers an iOS 26 sender puts on /Upload that we have
+                # never sent, captured 2026-07-31 22:09 by logging a real
+                # phone-to-laptop transfer (FINDINGS §34):
+                #
+                #   TotalBytes: 1303171
+                #   SenderPseudonym: pseud:RDUDcHgUEfGhmdJSNF0FmQ
+                #   SenderPushToken: 1D0DD878...0493
+                #   TransferID: 664D3979-F245-4E9E-9EAC-80453E255E31
+                #
+                # TransferID is the interesting one: without it the receiver has
+                # no way to tie an upload to the session it just accepted, which
+                # is exactly the shape of a refusal issued on the headers alone.
+                headers["TotalBytes"] = str(len(payload))
+                headers["TransferID"] = self._transfer_id
+                headers["SenderPseudonym"] = self._pseudonym
+                headers["SenderPushToken"] = self._push_token
+            if minimal:
+                # Match the shape the phone uses: User-Agent, Connection, and
+                # the framing header http.client adds itself. Content-Type stays
+                # because our own receiver reads it to pick a decoder, so an
+                # Apple sender must set it on /Upload even though it sets none on
+                # /Discover or /Ask.
+                headers["User-Agent"] = "AirDrop/1.0"
+                headers["Connection"] = "keep-alive"
+            if expect:
+                headers["Expect"] = "100-continue"
+            if use_length:
+                # Content-Length instead of chunked. http.client only chunks when
+                # it cannot determine a length, so handing it bytes with an
+                # explicit length changes the framing on the wire.
+                headers["Content-Length"] = str(len(payload))
+                body = payload
+            else:
+                body = io.BytesIO(payload)
+
+            logger.info(
+                f"Upload arm {i + 1}/{len(arms)}: {arm} "
+                f"({len(payload)} B, {'Content-Length' if use_length else 'chunked'},"
+                f" {headers['Content-Type']},"
+                f" {'Expect: 100-continue' if expect else 'no Expect'},"
+                f" {'new connection' if new_conn else 'reused connection'})"
+            )
+            try:
+                success, _ = self.send_POST(
+                    "/Upload",
+                    body,
+                    headers=headers,
+                    new_conn=new_conn,
+                    minimal=minimal,
+                    raw=raw,
+                )
+            except (OSError, HTTPException) as e:
+                logger.warning(f"Upload arm '{arm}' failed at the socket: {e}")
+                # The connection is unusable now whatever happened to it.
+                if self.http_conn is not None:
+                    try:
+                        self.http_conn.close()
+                    except OSError:
+                        pass
+                    self.http_conn = None
+                continue
+            if success:
+                logger.info(f"Upload arm '{arm}' ACCEPTED - this is the framing to use")
+                return True
+            logger.warning(f"Upload arm '{arm}' was answered, but not with 200")
+
+        return False
 
     def _get_headers(self):
         """
