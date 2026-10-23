@@ -1,3 +1,11 @@
+> **Personal fork, not supported.** This is the OpenDrop used by
+> [airdrop-mt7921](https://github.com/jedbillyb/airdrop-mt7921): upstream
+> v0.13.0 plus the iOS 26 fixes from that project, one commit per fix, on the
+> [`airdrop-mt7921`](https://github.com/jedbillyb/opendrop/commits/airdrop-mt7921)
+> branch. Issues about it belong in
+> [airdrop-mt7921](https://github.com/jedbillyb/airdrop-mt7921/issues). For
+> everything else use [seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop).
+
 # OpenDrop: an Open Source AirDrop Implementation
 
 [![Release](https://img.shields.io/pypi/v/opendrop?color=%23EC6500&label=release)](https://pypi.org/project/opendrop/)
