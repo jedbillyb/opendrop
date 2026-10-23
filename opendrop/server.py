@@ -127,6 +127,28 @@ class AirDropServer:
         properties = {b"flags": str(self.config.flags).encode("utf-8")}
         return properties
 
+        # Pin a large receive buffer, inherited by accepted connections.
+        #
+        # AWDL delivers in ~68 ms bursts separated by ~450 ms of silence, so a
+        # connection gets only a couple of round trips per second. That makes the
+        # kernel's receive-window recovery pathologically slow: measured on a real
+        # transfer, the advertised window opened at 64766 B, collapsed to 528 B in
+        # a single step when the sender's opening burst outran our first read(),
+        # and then took ~40 s to crawl back to 10 kB - longer than the whole
+        # transfer. Throughput was pinned at ~45 kB/s the entire time.
+        #
+        # A large fixed buffer means the opening burst cannot overrun us, so
+        # rcv_ssthresh never collapses and never has to recover. Setting
+        # SO_RCVBUF also disables autotuning, which is what we want here: the
+        # kernel's bandwidth estimate is meaningless on a link this bursty.
+        # The kernel clamps this to net.core.rmem_max and doubles what we ask for.
+        try:
+            httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            logger.debug(
+                f"SO_RCVBUF = {httpd.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)} B"
+            )
+        except OSError as e:
+            logger.warning(f"Could not enlarge the receive buffer ({e})")
 
 class HTTPServerV6(HTTPServer):
     address_family = socket.AF_INET6
@@ -283,12 +305,6 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # If pipelining is not support, 'Expect: 100-continue' is sent to which we need to respond
-        if self.headers.get("expect", "").lower() == "100-continue":
-            self.send_response(100)
-            self.send_header("Content-Length", 0)
-            self.end_headers()
-
         if self.headers.get("transfer-encoding", "").lower() != "chunked":
             logger.warning("Expect chunked transfer encoding")
             self.send_response(400)  # Bad Request
@@ -374,6 +390,17 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             os.getcwd(), f"airdrop-received-{int(start)}.{'dvzip' if 'dvzip' in self.headers.get('content-type', '') else 'cpio'}"
         )
         with open(raw_path, "wb") as raw:
+            # Only now tell the sender to go ahead. Upstream answered
+            # 'Expect: 100-continue' before the chunked check, the reader and this
+            # open() - so the phone began transmitting while we were still getting
+            # ready, and its opening burst collapsed our receive window (see the
+            # SO_RCVBUF note in create_server). Answering once we are genuinely
+            # ready to read costs nothing and removes that race.
+            if self.headers.get("expect", "").lower() == "100-continue":
+                self.send_response(100)
+                self.send_header("Content-Length", 0)
+                self.end_headers()
+
             while True:
                 buf = reader.read(65536)
                 if not buf:
