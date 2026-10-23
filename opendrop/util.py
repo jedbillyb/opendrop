@@ -115,9 +115,15 @@ class AirDropUtil:
         # Image.Resampling.LANCZOS is the same filter under its current name.
         # Without this, sending any image dies in send_ask() with
         #   AttributeError: module 'PIL.Image' has no attribute 'ANTIALIAS'
-        im.thumbnail((540, 540), Image.Resampling.LANCZOS)
+        # 360 px and LOSSY: a real iPhone sends a 360x272 icon of ~45 KB. The
+        # old 540 px lossless one was ~140 KB, three times the size, and on the
+        # MT7921's lossy AWDL link the phone dropped the /Ask mid-body
+        # (BrokenPipe) before it could show a prompt. RGB because JPEG2000
+        # rejects palette and RGBA PNGs.
+        im = im.convert("RGB")
+        im.thumbnail((360, 360), Image.Resampling.LANCZOS)
         img_bytes = io.BytesIO()
-        im.save(img_bytes, format="JPEG2000")
+        im.save(img_bytes, format="JPEG2000", quality_mode="rates", quality_layers=[20])
         file_icon = img_bytes.getvalue()
 
         # Small image
