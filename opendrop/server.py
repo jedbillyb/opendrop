@@ -554,13 +554,24 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 self.total += length
                 return length
 
-        def extract_stream(stream, flags=0):
+        # Every transfer is extracted under its own NSIRD_AirDrop_* directory. Extracting
+        # straight into the receive dir let an archive without iOS's wrapper overwrite an existing file of
+        # the same name (two phones' IMG_1023.jpg); the wrapper is what airdrop-tidy unwraps, renaming
+        # clashes to IMG_1023-1.jpg.
+        stage = f"NSIRD_AirDrop_opendrop-{time.time_ns()}"
+
+        def staged(entries):
+            for entry in entries:
+                entry.pathname = os.path.join(stage, entry.pathname)
+                yield entry
+
+        def extract_stream(stream, flags=libarchive.extract.PREVENT_ESCAPE):
             """
-            Extracts an archive from memory into the current directory.
+            Extracts an archive from a stream into the transfer's staging directory.
             """
 
             with libarchive.read.stream_reader(stream) as archive:
-                libarchive.extract.extract_entries(archive, flags)
+                libarchive.extract.extract_entries(staged(archive), flags)
 
         def dvzip_to_cpio(path):
             """
@@ -832,7 +843,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 # be renamed. Resolve it and require the result to stay under
                 # the current directory.
                 root = os.path.realpath(os.getcwd())
-                path = os.path.realpath(os.path.join(root, name))
+                path = os.path.realpath(os.path.join(root, stage, name))
                 if path != root and not path.startswith(root + os.sep):
                     logger.warning(f"refusing member outside the receive dir: {name}")
                     continue
@@ -871,7 +882,9 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             if raw_path.endswith(".dvzip"):
                 cpio_bytes = dvzip_to_cpio(raw_path)
                 try:
-                    libarchive.extract_memory(cpio_bytes)
+                    with libarchive.read.memory_reader(cpio_bytes) as archive:
+                        libarchive.extract.extract_entries(
+                            staged(archive), libarchive.extract.PREVENT_ESCAPE)
                 except Exception as e:  # noqa: BLE001
                     # A truncated archive raises AFTER writing the complete
                     # members, so nothing already on disk is lost.
