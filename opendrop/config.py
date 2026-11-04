@@ -81,7 +81,22 @@ class AirDropConfig:
         self.port = server_port
 
         if service_id is None:
-            service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
+            # Stable across runs: a fresh random ID every start made the iPhone list a stale
+            # copy of this machine next to the live one, since it caches the previous run's mDNS record.
+            id_file = os.path.join(self.airdrop_dir, "service_id")
+            try:
+                with open(id_file) as f:
+                    service_id = f.read().strip()
+            except OSError:
+                pass
+            if not service_id or len(service_id) != 12:
+                service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
+                try:
+                    os.makedirs(self.airdrop_dir, exist_ok=True)
+                    with open(id_file, "w") as f:
+                        f.write(service_id + "\n")
+                except OSError:
+                    pass
         self.service_id = service_id
 
         self.debug = debug
